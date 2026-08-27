@@ -73,6 +73,23 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
     return False
 
 
+def _clamp_gripper_limits(limits, ceiling):
+    """Clamp an incoming [speed_rad_s, torque_nm] pair to the configured pair.
+
+    The stream may only ever *soften* the gripper. The pair reaches the motor
+    as a current ceiling on a joint that is already stalled against whatever it
+    is holding, so a stale or malformed message that raised it would squeeze
+    harder on an object the operator had chosen to be gentle with. Clamping
+    here means the worst a bad message can do is the force the run started
+    with, which is the force every run before this feature used throughout.
+
+    A stronger-than-default mode is therefore not expressible by this input by
+    design: raise `gripper_posforce_limits` in the config and demote today's
+    value to a middle step instead.
+    """
+    return np.minimum(limits, ceiling)
+
+
 def _env_flag(name, default=False):
     v = os.getenv(name)
     if v is None:
@@ -185,6 +202,14 @@ def main():
     name = f"{args.side}_arm"
     config = openarm_driver.Config(args.config)
     align_threshold = args.align_threshold
+    # The pair the driver is initialized with is also the ceiling every
+    # incoming pair is clamped to.
+    gripper_ceiling = np.array(config.get_gripper_posforce_limits(), dtype=float)
+    # Held here rather than only in the driver because `start` builds a fresh
+    # SingleArmDriver, which re-reads the config and silently resets the
+    # limits. Without this the operator would be handed the default force back
+    # mid-run with a finger still on the grip, and nothing would say so.
+    gripper_limits = None
     arm = None
     ready_status = ArmStatus.ALIGNED if args.align else ArmStatus.STARTED
     if args.start_on_startup:
@@ -213,6 +238,10 @@ def main():
                     name, config
                 )  # Re-initialize the arm to ensure a fresh start
                 arm.start()
+                if gripper_limits is not None:
+                    # The fresh driver re-read the config, so the selection the
+                    # operator is currently holding has to be put back.
+                    arm.gripper_posforce_limits = gripper_limits
                 align_state = (
                     AlignState(step_limit=args.align_delta_limit)
                     if args.align
@@ -227,6 +256,33 @@ def main():
                     arm.stop()
                     arm = None  # Drop the instance to free resources
                 align_state = None
+        elif event_id == "gripper_limits":
+            # A [speed_rad_s, torque_nm] pair chosen by the operator, replacing
+            # the static config pair for as long as it stands. The driver reads
+            # this attribute fresh on every send_position, so the next command
+            # carries it -- no re-init, no control-mode change, no gap.
+            #
+            # Kept even while stopped, so a start that follows applies the
+            # selection already in force rather than the config default.
+            try:
+                incoming = np.asarray(event["value"], dtype=float)
+            except (TypeError, ValueError):
+                incoming = None
+            # Positive as well as finite: a negative pair is not softer, it is
+            # malformed, and guessing at it by taking a magnitude would be
+            # inventing an intent. Ignored outright instead, which leaves the
+            # selection already in force standing.
+            if (
+                incoming is None
+                or incoming.shape != (2,)
+                or not np.all(np.isfinite(incoming))
+                or not np.all(incoming > 0.0)
+            ):
+                print(f"Ignoring malformed gripper_limits: {event['value']}")
+                continue
+            gripper_limits = _clamp_gripper_limits(incoming, gripper_ceiling)
+            if arm is not None:
+                arm.gripper_posforce_limits = gripper_limits
         elif event_id == "request_position":
             if status is ArmStatus.STOPPED:
                 continue
